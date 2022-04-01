@@ -43,8 +43,6 @@
 #pragma warning(disable : 4820)
 #endif
 
-#include <stddef.h>
-#include <stdlib.h>
 
 #if defined(_MSC_VER)
 #pragma warning(pop)
@@ -53,7 +51,7 @@
 #if defined(_MSC_VER) && (_MSC_VER < 1920)
 typedef __int32 utf8_int32_t;
 #else
-#include <stdint.h>
+#include "stdint.h"
 typedef int32_t utf8_int32_t;
 #endif
 

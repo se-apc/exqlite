@@ -1,6 +1,5 @@
-#include <assert.h>
-#include <string.h>
-#include <stdio.h>
+#include "assert.h"
+#include "string.h"
 
 #include <erl_nif.h>
 #include <sqlite3.h>
