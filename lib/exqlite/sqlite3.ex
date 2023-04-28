@@ -12,40 +12,55 @@ defmodule Exqlite.Sqlite3 do
   # Need to figure out if we can just stream results where we use this
   # module as a sink.
 
+  alias Exqlite.Flags
   alias Exqlite.Sqlite3NIF
 
   @type db() :: reference()
   @type statement() :: reference()
   @type reason() :: atom() | String.t()
   @type row() :: list()
+  @type open_opt :: {:mode, :readwrite | :readonly}
 
   @doc """
   Opens a new sqlite database at the Path provided.
 
-  If `path` can be `":memory"` to keep the sqlite database in memory.
-  """
-  @spec open(String.t()) :: {:ok, db()} | {:error, reason()}
-  def open(path), do: Sqlite3NIF.open(String.to_charlist(path))
+  `path` can be `":memory"` to keep the sqlite database in memory.
 
-  @spec close(nil) :: :ok
-  def close(nil), do: :ok
+  ## Options
+
+    * `:mode` - use `:readwrite` to open the database for reading and writing
+      or `:readonly` to open it in read-only mode. `:readwrite` will also create
+      the database if it doesn't already exist. Defaults to `:readwrite`.
+  """
+  @spec open(String.t(), [open_opt()]) :: {:ok, db()} | {:error, reason()}
+  def open(path, opts \\ []) do
+    mode = Keyword.get(opts, :mode, :readwrite)
+    Sqlite3NIF.open(String.to_charlist(path), flags_from_mode(mode))
+  end
+
+  defp flags_from_mode(:readwrite),
+    do: Flags.put_file_open_flags([:sqlite_open_readwrite, :sqlite_open_create])
+
+  defp flags_from_mode(:readonly),
+    do: Flags.put_file_open_flags([:sqlite_open_readonly])
+
+  defp flags_from_mode(mode) do
+    raise ArgumentError,
+          "expected mode to be `:readwrite` or `:readonly`, but received #{inspect(mode)}"
+  end
 
   @doc """
   Closes the database and releases any underlying resources.
   """
-  @spec close(db()) :: :ok | {:error, reason()}
+  @spec close(db() | nil) :: :ok | {:error, reason()}
+  def close(nil), do: :ok
   def close(conn), do: Sqlite3NIF.close(conn)
 
   @doc """
   Executes an sql script. Multiple stanzas can be passed at once.
   """
   @spec execute(db(), String.t()) :: :ok | {:error, reason()}
-  def execute(conn, sql) do
-    case Sqlite3NIF.execute(conn, sql) do
-      :ok -> :ok
-      {:error, reason} -> {:error, reason}
-    end
-  end
+  def execute(conn, sql), do: Sqlite3NIF.execute(conn, sql)
 
   @doc """
   Get the number of changes recently.
@@ -58,9 +73,7 @@ defmodule Exqlite.Sqlite3 do
   def changes(conn), do: Sqlite3NIF.changes(conn)
 
   @spec prepare(db(), String.t()) :: {:ok, statement()} | {:error, reason()}
-  def prepare(conn, sql) do
-    Sqlite3NIF.prepare(conn, sql)
-  end
+  def prepare(conn, sql), do: Sqlite3NIF.prepare(conn, sql)
 
   @spec bind(db(), statement(), nil) :: :ok | {:error, reason()}
   def bind(conn, statement, nil), do: bind(conn, statement, [])
@@ -73,7 +86,7 @@ defmodule Exqlite.Sqlite3 do
   @spec columns(db(), statement()) :: {:ok, [binary()]} | {:error, reason()}
   def columns(conn, statement), do: Sqlite3NIF.columns(conn, statement)
 
-  @spec step(db(), statement()) :: :done | :busy | {:row, [row()]} | {:error, reason()}
+  @spec step(db(), statement()) :: :done | :busy | {:row, row()} | {:error, reason()}
   def step(conn, statement), do: Sqlite3NIF.step(conn, statement)
 
   @spec multi_step(db(), statement()) ::
@@ -118,7 +131,18 @@ defmodule Exqlite.Sqlite3 do
 
   @spec fetch_all(db(), statement(), integer()) :: {:ok, [row()]} | {:error, reason()}
   def fetch_all(conn, statement, chunk_size) do
-    fetch_all(conn, statement, chunk_size, [])
+    {:ok, try_fetch_all(conn, statement, chunk_size)}
+  catch
+    :throw, {:error, _reason} = error -> error
+  end
+
+  defp try_fetch_all(conn, statement, chunk_size) do
+    case multi_step(conn, statement, chunk_size) do
+      {:done, rows} -> rows
+      {:rows, rows} -> rows ++ try_fetch_all(conn, statement, chunk_size)
+      {:error, _reason} = error -> throw(error)
+      :busy -> throw({:error, "Database busy"})
+    end
   end
 
   @spec fetch_all(db(), statement()) :: {:ok, [row()]} | {:error, reason()}
@@ -129,26 +153,7 @@ defmodule Exqlite.Sqlite3 do
     #
     # For now this just works
     chunk_size = Application.get_env(:exqlite, :default_chunk_size, 50)
-    fetch_all(conn, statement, chunk_size, [])
-  end
-
-  defp fetch_all(conn, statement, chunk_size, accum) do
-    case multi_step(conn, statement, chunk_size) do
-      {:done, rows} ->
-        case accum do
-          [] -> {:ok, rows}
-          accum -> {:ok, Enum.reverse(rows ++ accum)}
-        end
-
-      {:rows, rows} ->
-        fetch_all(conn, statement, chunk_size, Enum.reverse(rows) ++ accum)
-
-      {:error, reason} ->
-        {:error, reason}
-
-      :busy ->
-        {:error, "Database busy"}
-    end
+    fetch_all(conn, statement, chunk_size)
   end
 
   @doc """

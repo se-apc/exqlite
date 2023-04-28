@@ -37,6 +37,70 @@ defmodule Exqlite.ConnectionTest do
       File.rm(path)
     end
 
+    test "connects to a file from URL" do
+      path = Temp.path!()
+
+      {:ok, state} = Connection.connect(database: "file:#{path}?mode=rwc")
+
+      assert state.directory == Path.dirname(path)
+      assert state.db
+    end
+
+    test "fails to write a file from URL with mode=ro" do
+      path = Temp.path!()
+
+      {:ok, db} = Sqlite3.open(path)
+
+      :ok =
+        Sqlite3.execute(db, "create table test (id ingeger primary key, stuff text)")
+
+      :ok =
+        Sqlite3.execute(db, "insert into test (id, stuff) values (999, 'Some stuff')")
+
+      :ok = Sqlite3.close(db)
+
+      {:ok, conn} = Connection.connect(database: "file:#{path}?mode=ro")
+
+      assert conn.directory == Path.dirname(path)
+      assert conn.db
+
+      assert match?(
+               {:ok, _, %{rows: [[1]]}, _},
+               %Query{statement: "select count(*) from test"}
+               |> Connection.handle_execute([], [], conn)
+             )
+
+      {:error, %{message: message}, _} =
+        %Query{
+          statement: "insert into test (id, stuff) values (888, 'some more stuff')"
+        }
+        |> Connection.handle_execute([], [], conn)
+
+      # In most of the test matrix the message is "attempt to write a readonly database",
+      # but in Elixir 1.13, OTP 23, OS windows-2019 it is "not an error".
+      assert message in ["attempt to write a readonly database", "not an error"]
+
+      File.rm(path)
+    end
+
+    test "setting custom_pragmas" do
+      path = Temp.path!()
+
+      {:ok, state} =
+        Connection.connect(
+          database: path,
+          custom_pragmas: [
+            checkpoint_fullfsync: 0
+          ]
+        )
+
+      assert state.db
+
+      assert {:ok, 0} = get_pragma(state.db, :checkpoint_fullfsync)
+
+      File.rm(path)
+    end
+
     test "setting journal_size_limit" do
       path = Temp.path!()
       size_limit = 20 * 1024 * 1024
@@ -71,6 +135,31 @@ defmodule Exqlite.ConnectionTest do
       assert {:ok, ^size_limit} = get_pragma(state.db, :hard_heap_limit)
 
       File.rm(path)
+    end
+
+    test "setting connection mode" do
+      path = Temp.path!()
+
+      # Create readwrite connection
+      {:ok, rw_state} = Connection.connect(database: path)
+      create_table_query = "create table test (id integer primary key, stuff text)"
+      :ok = Sqlite3.execute(rw_state.db, create_table_query)
+
+      insert_value_query = "insert into test (stuff) values ('This is a test')"
+      :ok = Sqlite3.execute(rw_state.db, insert_value_query)
+
+      # Read from database with a readonly connection
+      {:ok, ro_state} = Connection.connect(database: path, mode: :readonly)
+
+      select_query = "select id, stuff from test order by id asc"
+      {:ok, statement} = Sqlite3.prepare(ro_state.db, select_query)
+      {:row, columns} = Sqlite3.step(ro_state.db, statement)
+
+      assert [1, "This is a test"] == columns
+
+      # Readonly connection cannot insert
+      assert {:error, "attempt to write a readonly database"} ==
+               Sqlite3.execute(ro_state.db, insert_value_query)
     end
   end
 

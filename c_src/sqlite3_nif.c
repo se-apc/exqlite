@@ -2,6 +2,11 @@
 #include <string.h>
 #include <stdio.h>
 
+// Elixir workaround for . in module names
+#ifdef STATIC_ERLANG_NIF
+#define STATIC_ERLANG_NIF_LIBNAME sqlite3_nif
+#endif
+
 #include <erl_nif.h>
 #include <sqlite3.h>
 
@@ -17,10 +22,12 @@ static sqlite3_mem_methods default_alloc_methods = {0};
 typedef struct connection
 {
     sqlite3* db;
+    ErlNifMutex* mutex;
 } connection_t;
 
 typedef struct statement
 {
+    connection_t* conn;
     sqlite3_stmt* statement;
 } statement_t;
 
@@ -182,13 +189,16 @@ exqlite_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
 {
     assert(env);
 
+    int flags;
     int rc             = 0;
     int size           = 0;
     connection_t* conn = NULL;
+    sqlite3* db        = NULL;
+    ErlNifMutex* mutex = NULL;
     char filename[MAX_PATHNAME];
     ERL_NIF_TERM result;
 
-    if (argc != 1) {
+    if (argc != 2) {
         return enif_make_badarg(env);
     }
 
@@ -197,18 +207,31 @@ exqlite_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         return make_error_tuple(env, "invalid_filename");
     }
 
-    conn = enif_alloc_resource(connection_type, sizeof(connection_t));
-    if (!conn) {
-        return make_error_tuple(env, "out_of_memory");
+    if (!enif_get_int(env, argv[1], &flags)) {
+        return make_error_tuple(env, "invalid flags");
     }
 
-    rc = sqlite3_open(filename, &conn->db);
+    rc = sqlite3_open_v2(filename, &db, flags, NULL);
     if (rc != SQLITE_OK) {
-        enif_release_resource(conn);
         return make_error_tuple(env, "database_open_failed");
     }
 
-    sqlite3_busy_timeout(conn->db, 2000);
+    mutex = enif_mutex_create("exqlite:connection");
+    if (mutex == NULL) {
+        sqlite3_close_v2(db);
+        return make_error_tuple(env, "failed_to_create_mutex");
+    }
+
+    sqlite3_busy_timeout(db, 2000);
+
+    conn = enif_alloc_resource(connection_type, sizeof(connection_t));
+    if (!conn) {
+        sqlite3_close_v2(db);
+        enif_mutex_destroy(mutex);
+        return make_error_tuple(env, "out_of_memory");
+    }
+    conn->db    = db;
+    conn->mutex = mutex;
 
     result = enif_make_resource(env, conn);
     enif_release_resource(conn);
@@ -245,14 +268,24 @@ exqlite_close(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
         }
     }
 
+    // close connection in critical section to avoid race-condition
+    // cases. Cases such as query timeout and connection pooling
+    // attempting to close the connection
+    enif_mutex_lock(conn->mutex);
+
     // note: _v2 may not fully close the connection, hence why we check if
     // any transaction is open above, to make sure other connections aren't blocked.
     // v1 is guaranteed to close or error, but will return error if any
     // unfinalized statements, which we likely have, as we rely on the destructors
     // to later run to clean those up
-    sqlite3_close_v2(conn->db);
+    rc = sqlite3_close_v2(conn->db);
+    if (rc != SQLITE_OK) {
+        enif_mutex_unlock(conn->mutex);
+        return make_sqlite3_error_tuple(env, rc, conn->db);
+    }
 
     conn->db = NULL;
+    enif_mutex_unlock(conn->mutex);
 
     return make_atom(env, "ok");
 }
@@ -343,8 +376,21 @@ exqlite_prepare(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[])
     if (!statement) {
         return make_error_tuple(env, "out_of_memory");
     }
+    statement->statement = NULL;
 
+    enif_keep_resource(conn);
+    statement->conn = conn;
+
+    // ensure connection is not getting closed by parallel thread
+    enif_mutex_lock(conn->mutex);
+    if (conn->db == NULL) {
+        enif_mutex_unlock(conn->mutex);
+        enif_release_resource(statement);
+        return make_error_tuple(env, "connection closed");
+    }
     rc = sqlite3_prepare_v3(conn->db, (char*)bin.data, bin.size, 0, &statement->statement, NULL);
+    enif_mutex_unlock(conn->mutex);
+
     if (rc != SQLITE_OK) {
         enif_release_resource(statement);
         return make_sqlite3_error_tuple(env, rc, conn->db);
@@ -841,6 +887,11 @@ connection_type_destructor(ErlNifEnv* env, void* arg)
         sqlite3_close_v2(conn->db);
         conn->db = NULL;
     }
+
+    if (conn->mutex) {
+        enif_mutex_destroy(conn->mutex);
+        conn->mutex = NULL;
+    }
 }
 
 static void
@@ -854,6 +905,11 @@ statement_type_destructor(ErlNifEnv* env, void* arg)
     if (statement->statement) {
         sqlite3_finalize(statement->statement);
         statement->statement = NULL;
+    }
+
+    if (statement->conn) {
+        enif_release_resource(statement->conn);
+        statement->conn = NULL;
     }
 }
 
@@ -944,7 +1000,7 @@ exqlite_enable_load_extension(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
 //
 
 static ErlNifFunc nif_funcs[] = {
-  {"open", 1, exqlite_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
+  {"open", 2, exqlite_open, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"close", 1, exqlite_close, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"execute", 2, exqlite_execute, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"changes", 1, exqlite_changes, ERL_NIF_DIRTY_JOB_IO_BOUND},
@@ -960,11 +1016,5 @@ static ErlNifFunc nif_funcs[] = {
   {"release", 2, exqlite_release, ERL_NIF_DIRTY_JOB_IO_BOUND},
   {"enable_load_extension", 2, exqlite_enable_load_extension, ERL_NIF_DIRTY_JOB_IO_BOUND},
 };
-
-// Elixir workaround for . in module names
-#ifdef STATIC_ERLANG_NIF
-#undef ERL_NIF_INIT_DECL
-#define ERL_NIF_INIT_DECL(MODNAME) ErlNifEntry* sqlite3_nif_nif_init(ERL_NIF_INIT_ARGS)
-#endif
 
 ERL_NIF_INIT(Elixir.Exqlite.Sqlite3NIF, nif_funcs, on_load, NULL, NULL, on_unload)

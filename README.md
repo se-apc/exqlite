@@ -6,7 +6,7 @@
 
 An Elixir SQLite3 library.
 
-If you are looking for the Ecto adapater, take a look at the
+If you are looking for the Ecto adapter, take a look at the
 [Ecto SQLite3 library][ecto_sqlite3].
 
 Documentation: https://hexdocs.pm/exqlite
@@ -34,7 +34,7 @@ Package: https://hex.pm/packages/exqlite
 ```elixir
 defp deps do
   [
-    {:exqlite, "~> 0.10.3"}
+    {:exqlite, "~> 0.13"}
   ]
 end
 ```
@@ -42,15 +42,40 @@ end
 
 ## Configuration
 
+### Runtime Configuration
+
 ```elixir
 config :exqlite, default_chunk_size: 100
 ```
 
 * `default_chunk_size` - The chunk size that is used when multi-stepping when
   not specifying the chunk size explicitly.
+  
+### Compile-time Configuration
 
+In `config/config.exs`,
+
+```elixir
+config :exqlite, force_build: false
+```
+
+* `force_build` - Set `true` to opt out of using precompiled artefacts.
+  This option only affects the default configuration. For advanced configuation,
+  this library will always compile natively.
 
 ## Advanced Configuration
+
+### Defining Extra Compile Flags
+
+You can enable certain features by doing the following:
+
+```bash
+export EXQLITE_SYSTEM_CFLAGS=-DSQLITE_ENABLE_DBSTAT_VTAB=1
+```
+
+### Listing Flags Used For Compilation
+
+If you `export V=1` the flags used for compilation will be output to stdout.
 
 ### Using System Installed Libraries
 
@@ -176,6 +201,14 @@ We are using the Dirty NIF scheduler to execute the sqlite calls. The rationale
 behind this is that maintaining each sqlite's connection command pool is
 complicated and error prone.
 
+
+## Compiling NIF for Windows
+
+When compiling on Windows, you will need the [Build Tools](https://visualstudio.microsoft.com/downloads/#build-tools-for-visual-studio-2022) or equivalent toolchain. Please make sure you have the correct environment variables, including path to compiler and linker and architecture that matches `erl.exe` (likely x64).
+
+You may also need to invoke `vcvarsall.bat amd64` _before_ running `mix`.
+
+A guide is available at [guides/windows.md](./guides/windows.md)
 
 ## Contributing
 
