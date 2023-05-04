@@ -1,6 +1,6 @@
 defmodule Exqlite.Connection do
   @moduledoc """
-  This module imlements connection details as defined in DBProtocol.
+  This module implements connection details as defined in DBProtocol.
 
   ## Attributes
 
@@ -28,9 +28,11 @@ defmodule Exqlite.Connection do
   alias Exqlite.Query
   alias Exqlite.Result
   alias Exqlite.Sqlite3
+  require Logger
 
   defstruct [
     :db,
+    :directory,
     :path,
     :transaction_status,
     :status,
@@ -39,10 +41,38 @@ defmodule Exqlite.Connection do
 
   @type t() :: %__MODULE__{
           db: Sqlite3.db(),
+          directory: String.t() | nil,
           path: String.t(),
           transaction_status: :idle | :transaction,
           status: :idle | :busy
         }
+
+  @type journal_mode() :: :delete | :truncate | :persist | :memory | :wal | :off
+  @type temp_store() :: :default | :file | :memory
+  @type synchronous() :: :extra | :full | :normal | :off
+  @type auto_vacuum() :: :none | :full | :incremental
+  @type locking_mode() :: :normal | :exclusive
+
+  @type connection_opt() ::
+          {:database, String.t()}
+          | {:journal_mode, journal_mode()}
+          | {:temp_store, temp_store()}
+          | {:synchronous, synchronous()}
+          | {:foreign_keys, :on | :off}
+          | {:cache_size, integer()}
+          | {:cache_spill, :on | :off}
+          | {:case_sensitive_like, boolean()}
+          | {:auto_vacuum, auto_vacuum()}
+          | {:locking_mode, locking_mode()}
+          | {:secure_delete, :on | :off}
+          | {:wal_auto_check_point, integer()}
+          | {:busy_timeout, integer()}
+          | {:chunk_size, integer()}
+          | {:journal_size_limit, integer()}
+          | {:soft_heap_limit, integer()}
+          | {:hard_heap_limit, integer()}
+          | {:key, String.t()}
+          | {:custom_pragmas, [{keyword(), integer() | boolean() | String.t()}]}
 
   @impl true
   @doc """
@@ -56,6 +86,9 @@ defmodule Exqlite.Connection do
 
     * `:database` - The path to the database. In memory is allowed. You can use
       `:memory` or `":memory:"` to designate that.
+    * `:mode` - use `:readwrite` to open the database for reading and writing
+      or `:readonly` to open it in read-only mode. `:readwrite` will also create
+      the database if it doesn't already exist. Defaults to `:readwrite`.
     * `:journal_mode` - Sets the journal mode for the sqlite connection. Can be
       one of the following `:delete`, `:truncate`, `:persist`, `:memory`,
       `:wal`, or `:off`. Defaults to `:delete`. It is recommended that you use
@@ -81,7 +114,7 @@ defmodule Exqlite.Connection do
       `:incremental`. Depending on the database size, `:incremental` may be
       beneficial.
     * `:locking_mode` - Defaults to `:normal`. Allowed values are `:normal` or
-      `:exclusive`. See [sqlite documenation][1] for more information.
+      `:exclusive`. See [sqlite documentation][1] for more information.
     * `:secure_delete` - Defaults to `:off`. If enabled, it will cause SQLite3
       to overwrite records that were deleted with zeros.
     * `:wal_auto_check_point` - Sets the write-ahead log auto-checkpoint
@@ -95,11 +128,39 @@ defmodule Exqlite.Connection do
     * `:journal_size_limit` - The size limit in bytes of the journal.
     * `:soft_heap_limit` - The size limit in bytes for the heap limit.
     * `:hard_heap_limit` - The size limit in bytes for the heap.
+    * `:custom_pragmas` - A list of custom pragmas to set on the connection, for example to configure extensions.
+    * `:load_extensions` - A list of paths identifying extensions to load. Defaults to `[]`.
+      The provided list will be merged with the global extensions list, set on `:exqlite, :load_extensions`.
+      Be aware that the path should handle pointing to a library compiled for the current architecture.
+      Example configuration:
 
-  For more information about the options above, see [sqlite documenation][1]
+      ```
+        arch_dir =
+          System.cmd("uname", ["-sm"])
+          |> elem(0)
+          |> String.trim()
+          |> String.replace(" ", "-")
+          |> String.downcase() # => "darwin-arm64"
+
+        config :myapp, arch_dir: arch_dir
+
+        # global
+        config :exqlite, load_extensions: [ "./priv/sqlite/\#{arch_dir}/rotate" ]
+
+        # per connection in a Phoenix app
+        config :myapp, Myapp.Repo,
+          database: "path/to/db",
+          load_extensions: [
+            "./priv/sqlite/\#{arch_dir}/vector0",
+            "./priv/sqlite/\#{arch_dir}/vss0"
+          ]
+      ```
+
+  For more information about the options above, see [sqlite documentation][1]
 
   [1]: https://www.sqlite.org/pragma.html
   """
+  @spec connect([connection_opt()]) :: {:ok, t()} | {:error, Exception.t()}
   def connect(options) do
     database = Keyword.get(options, :database)
 
@@ -132,7 +193,7 @@ defmodule Exqlite.Connection do
   def disconnect(_err, %__MODULE__{db: db}) do
     case Sqlite3.close(db) do
       :ok -> :ok
-      {:error, reason} -> {:error, %Error{message: reason}}
+      {:error, reason} -> {:error, %Error{message: to_string(reason)}}
     end
   end
 
@@ -246,7 +307,7 @@ defmodule Exqlite.Connection do
   end
 
   @doc """
-  Close a query prepared by `c:handle_prepare/3` with the database. Return
+  Close a query prepared by `handle_prepare/3` with the database. Return
   `{:ok, result, state}` on success and to continue,
   `{:error, exception, state}` to return an error and continue, or
   `{:disconnect, exception, state}` to return an error and disconnect.
@@ -276,35 +337,21 @@ defmodule Exqlite.Connection do
   end
 
   @impl true
-  def handle_fetch(%Query{statement: statement}, cursor, _opts, state) do
-    case Sqlite3.step(state.db, cursor) do
-      :done ->
-        {
-          :halt,
-          %Result{
-            rows: [],
-            command: :fetch,
-            num_rows: 0
-          },
-          state
-        }
+  def handle_fetch(%Query{statement: statement}, cursor, opts, state) do
+    chunk_size = opts[:chunk_size] || opts[:max_rows] || state.chunk_size
 
-      {:row, row} ->
-        {
-          :cont,
-          %Result{
-            rows: [row],
-            command: :fetch,
-            num_rows: 1
-          },
-          state
-        }
+    case Sqlite3.multi_step(state.db, cursor, chunk_size) do
+      {:done, rows} ->
+        {:halt, %Result{rows: rows, command: :fetch, num_rows: length(rows)}, state}
 
-      :busy ->
-        {:error, %Error{message: "Database busy", statement: statement}, state}
+      {:rows, rows} ->
+        {:cont, %Result{rows: rows, command: :fetch, num_rows: chunk_size}, state}
 
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
+
+      :busy ->
+        {:error, %Error{message: "Database is busy", statement: statement}, state}
     end
   end
 
@@ -352,6 +399,25 @@ defmodule Exqlite.Connection do
       {:ok, key} -> set_pragma(db, "key", key)
       _ -> :ok
     end
+  end
+
+  defp set_custom_pragmas(db, options) do
+    # we can't use maybe_set_pragma because some pragmas
+    # are required to be set before the database is e.g. decrypted.
+    case Keyword.fetch(options, :custom_pragmas) do
+      {:ok, list} -> do_set_custom_pragmas(db, list)
+      _ -> :ok
+    end
+  end
+
+  defp do_set_custom_pragmas(db, list) do
+    list
+    |> Enum.reduce_while(:ok, fn {key, value}, :ok ->
+      case set_pragma(db, key, value) do
+        :ok -> {:cont, :ok}
+        {:error, _reason} -> {:halt, :error}
+      end
+    end)
   end
 
   defp set_pragma_if_present(_db, _pragma, nil), do: :ok
@@ -421,10 +487,36 @@ defmodule Exqlite.Connection do
     set_pragma(db, "busy_timeout", Pragma.busy_timeout(options))
   end
 
-  defp do_connect(path, options) do
-    with :ok <- mkdir_p(path),
-         {:ok, db} <- Sqlite3.open(path),
+  defp load_extensions(db, options) do
+    global_extensions = Application.get_env(:exqlite, :load_extensions, [])
+
+    extensions =
+      Keyword.get(options, :load_extensions, [])
+      |> Enum.concat(global_extensions)
+      |> Enum.uniq()
+
+    do_load_extensions(db, extensions)
+  end
+
+  defp do_load_extensions(_db, []), do: :ok
+
+  defp do_load_extensions(db, extensions) do
+    Sqlite3.enable_load_extension(db, true)
+
+    Enum.each(extensions, fn extension ->
+      Logger.debug(fn -> "Exqlite: loading extension `#{extension}`" end)
+      Sqlite3.execute(db, "SELECT load_extension('#{extension}')")
+    end)
+
+    Sqlite3.enable_load_extension(db, false)
+  end
+
+  defp do_connect(database, options) do
+    with {:ok, directory} <- resolve_directory(database),
+         :ok <- mkdir_p(directory),
+         {:ok, db} <- Sqlite3.open(database, options),
          :ok <- set_key(db, options),
+         :ok <- set_custom_pragmas(db, options),
          :ok <- set_journal_mode(db, options),
          :ok <- set_temp_store(db, options),
          :ok <- set_synchronous(db, options),
@@ -439,10 +531,12 @@ defmodule Exqlite.Connection do
          :ok <- set_busy_timeout(db, options),
          :ok <- set_journal_size_limit(db, options),
          :ok <- set_soft_heap_limit(db, options),
-         :ok <- set_hard_heap_limit(db, options) do
+         :ok <- set_hard_heap_limit(db, options),
+         :ok <- load_extensions(db, options) do
       state = %__MODULE__{
         db: db,
-        path: path,
+        directory: directory,
+        path: database,
         transaction_status: :idle,
         status: :idle,
         chunk_size: Keyword.get(options, :chunk_size)
@@ -451,7 +545,7 @@ defmodule Exqlite.Connection do
       {:ok, state}
     else
       {:error, reason} ->
-        {:error, %Exqlite.Error{message: reason}}
+        {:error, %Exqlite.Error{message: to_string(reason)}}
     end
   end
 
@@ -472,7 +566,7 @@ defmodule Exqlite.Connection do
       {:ok, query}
     else
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
 
@@ -485,7 +579,7 @@ defmodule Exqlite.Connection do
         {:ok, %{query | ref: ref}}
 
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
 
@@ -548,7 +642,7 @@ defmodule Exqlite.Connection do
         {:ok, query}
 
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
 
@@ -558,7 +652,7 @@ defmodule Exqlite.Connection do
         {:ok, columns}
 
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
 
@@ -568,7 +662,7 @@ defmodule Exqlite.Connection do
         {:ok, rows}
 
       {:error, reason} ->
-        {:error, %Error{message: reason, statement: statement}, state}
+        {:error, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
 
@@ -585,14 +679,28 @@ defmodule Exqlite.Connection do
       {:ok, result, %{state | transaction_status: transaction_status}}
     else
       {:error, reason} ->
-        {:disconnect, %Error{message: reason, statement: statement}, state}
+        {:disconnect, %Error{message: to_string(reason), statement: statement}, state}
     end
   end
+
+  defp resolve_directory(":memory:"), do: {:ok, nil}
+
+  defp resolve_directory("file:" <> _ = uri) do
+    case URI.parse(uri) do
+      %{path: path} when is_binary(path) ->
+        {:ok, Path.dirname(path)}
+
+      _ ->
+        {:error, "No path in #{inspect(uri)}"}
+    end
+  end
+
+  defp resolve_directory(path), do: {:ok, Path.dirname(path)}
 
   # SQLITE_OPEN_CREATE will create the DB file if not existing, but
   # will not create intermediary directories if they are missing.
   # So let's preemptively create the intermediate directories here
   # before trying to open the DB file.
-  defp mkdir_p(":memory:"), do: :ok
-  defp mkdir_p(path), do: File.mkdir_p(Path.dirname(path))
+  defp mkdir_p(nil), do: :ok
+  defp mkdir_p(directory), do: File.mkdir_p(directory)
 end

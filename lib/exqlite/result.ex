@@ -1,5 +1,7 @@
 defmodule Exqlite.Result do
-  @moduledoc false
+  @moduledoc """
+  The database results.
+  """
 
   @type t :: %__MODULE__{
           command: atom,
@@ -17,5 +19,17 @@ defmodule Exqlite.Result do
       rows: Keyword.get(options, :rows, []),
       num_rows: Keyword.get(options, :num_rows, 0)
     }
+  end
+end
+
+if Code.ensure_loaded?(Table.Reader) do
+  defimpl Table.Reader, for: Exqlite.Result do
+    def init(%{columns: columns}) when columns in [nil, []] do
+      {:rows, %{columns: []}, []}
+    end
+
+    def init(result) do
+      {:rows, %{columns: result.columns}, result.rows}
+    end
   end
 end
